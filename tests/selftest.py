@@ -93,6 +93,7 @@ def spawn_servers() -> Tuple[list, str, str, str, str]:
     env.update(
         RAIN_DB_PATH=db_path,
         RAIN_TEST_PUBLISH_DELAY_S="0.6",
+        RAIN_TEST_ANALYSIS_DELAY_S="0.6",
         RAIN_TEST_FAIL_MARKER=fail_marker,
         PYTHONPATH=ROOT,
     )
@@ -117,7 +118,8 @@ def spawn_servers() -> Tuple[list, str, str, str, str]:
         except Exception:
             pass
         time.sleep(0.2)
-    raise RuntimeError("servers did not become healthy")
+    shutdown(procs)
+    raise RuntimeError(f"servers did not become healthy (logs in {tmp})")
 
 
 def shutdown(procs: list) -> None:
@@ -134,28 +136,27 @@ def main() -> int:
     base_a = os.environ.get("RAIN_BASE_A")
     base_b = os.environ.get("RAIN_BASE_B")
     fail_marker = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
-    spawned = False
-    procs: list = []
+    spawn_procs: list = []
     if not base_a or not base_b:
-        procs, base_a, base_b, fail_marker, _ = spawn_servers()
-        spawned = True
+        spawn_procs, base_a, base_b, fail_marker, _ = spawn_servers()
         print(f"[setup] spawned dual instances {base_a} / {base_b}")
     hooks_enabled = bool(fail_marker)
     try:
         run(base_a, base_b, fail_marker, hooks_enabled)
     finally:
-        if spawned:
-            shutdown(procs)
+        if spawn_procs:
+            shutdown(spawn_procs)
     print(f"\nALL TESTS PASSED ({PASS_COUNT} assertions)")
     return 0
 
 
 def register(base: str, members: int = 3, rows: int = 2, cols: int = 2,
-             thresholds=(5.0, 10.0), names=None) -> dict:
+             thresholds=(5.0, 10.0), names=None,
+             forecast_time: str = "2026-11-16T00:00:00Z") -> dict:
     if names is None:
         names = [f"m{i}" for i in range(1, members + 1)]
     body = {
-        "forecast_time": "2026-11-16T00:00:00Z",
+        "forecast_time": forecast_time,
         "rows": rows, "cols": cols,
         "member_names": names,
         "thresholds": list(thresholds),
@@ -163,6 +164,14 @@ def register(base: str, members: int = 3, rows: int = 2, cols: int = 2,
     status, data = http("POST", base, "/groups", body)
     assert status == 201, (status, data)
     return data
+
+
+def analysis(base: str, group_ids, threshold=5.0, line=0.5) -> Tuple[int, Any]:
+    return http("POST", base, "/analysis/persistent-high-risk", {
+        "group_ids": list(group_ids),
+        "threshold": threshold,
+        "probability_threshold": line,
+    })
 
 
 def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None:
@@ -434,11 +443,261 @@ def run(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None
     check("openapi.json served", s == 200 and "paths" in openapi)
     for path in ("/groups", "/groups/{group_id}/members/{member_id}",
                  "/groups/{group_id}/publish",
-                 "/groups/{group_id}/products/current"):
+                 "/groups/{group_id}/products/current",
+                 "/analysis/persistent-high-risk"):
         check(f"path {path} documented", path in openapi["paths"])
     req = urllib.request.Request(base_a + "/docs")
     with urllib.request.urlopen(req, timeout=10) as resp:
         check("Swagger UI served", resp.status == 200 and b"swagger" in resp.read().lower())
+
+    run_analysis_tests(base_a, base_b, fail_marker, hooks_enabled)
+
+
+def _grid(values: list, rows: int, cols: int) -> list:
+    """Reshape a flat list into a rows x cols matrix (already-nested input passes through)."""
+    if values and isinstance(values[0], list):
+        return values
+    flat = list(values)
+    assert len(flat) == rows * cols, (len(flat), rows, cols)
+    return [flat[r * cols:(r + 1) * cols] for r in range(rows)]
+
+
+def _build_series(base: str, specs: Dict[str, Dict[str, Any]], rows: int = 1, cols: int = 5,
+                  thresholds=(5.0, 10.0)):
+    """Register + publish one 2-member time step per spec; returns {name: (gid, pid)}."""
+    out: Dict[str, Tuple[str, int]] = {}
+    for name, spec in specs.items():
+        g = register(base, members=2, rows=rows, cols=cols, thresholds=thresholds,
+                     forecast_time=spec["time"])
+        gid = g["group_id"]
+        for member in ("m1", "m2"):
+            body: Dict[str, Any] = {
+                "rain": _grid(spec[member], rows, cols),
+                "revision": 1,
+            }
+            if spec.get("miss") is not None:
+                body["missing"] = _grid(spec["miss"], rows, cols)
+            s, d = http("PUT", base, f"/groups/{gid}/members/{member}", body)
+            assert s == 200, (s, d)
+        s, p = http("POST", base, f"/groups/{gid}/publish")
+        assert s == 200, (s, p)
+        out[name] = (gid, p["product_id"])
+    return out
+
+
+def run_analysis_tests(base_a: str, base_b: str, fail_marker: str, hooks_enabled: bool) -> None:
+    print("\n[13] cross-time persistent high-risk analysis: streak semantics")
+    # 2 members -> per-cell probability in {0, 0.5, 1}; threshold 5, line 0.5.
+    # c0 1,1,1,1     -> first confirmed at step 2
+    # c1 1,0,1,1     -> first confirmed at step 4
+    # c2 1,null,1,1  -> the null breaks the t0/t1 streak, so first confirmed at
+    #                   step 4 (it would be step 2 if a gap did not interrupt)
+    # c3 .5,.5,.5,.5 -> boundary equality qualifies; first confirmed at step 2
+    # c4 0,0,0,0     -> never
+    specs = {
+        "t0": {"time": "2026-11-16T00:00:00Z",
+               "m1": [10, 10, 10, 10, 0], "m2": [10, 10, 10, 0, 0]},
+        "t1": {"time": "2026-11-16T01:00:00Z", "miss": [0, 0, 1, 0, 0],
+               "m1": [10, 0, 99, 10, 0], "m2": [10, 0, 99, 0, 0]},
+        "t2": {"time": "2026-11-16T02:00:00Z",
+               "m1": [10, 10, 10, 10, 0], "m2": [10, 10, 10, 0, 0]},
+        "t3": {"time": "2026-11-16T03:00:00Z",
+               "m1": [10, 10, 10, 10, 0], "m2": [10, 10, 10, 0, 0]},
+    }
+    series = _build_series(base_a, specs)
+    t0, t1, t2, t3 = (series[k] for k in ("t0", "t1", "t2", "t3"))
+    order = [t0[0], t1[0], t2[0], t3[0]]
+
+    s, a = analysis(base_b, order, threshold=5.0, line=0.5)
+    check("analysis succeeds on four published times", s == 200, str(a))
+    check("all four product ids listed in order",
+          a["product_ids"] == [t0[1], t1[1], t2[1], t3[1]], str(a["product_ids"]))
+    check("products_used carries id/time/revisions",
+          [p["product_id"] for p in a["products_used"]] == a["product_ids"]
+          and [p["forecast_time"] for p in a["products_used"]] == a["forecast_times"])
+    check("first confirmed steps are second round of each streak",
+          a["first_confirmed_step"] == [[2, 4, 4, 2, None]], str(a["first_confirmed_step"]))
+    check("null-probability round breaks the streak",
+          a["first_confirmed_step"][0][2] == 4,
+          f"cell c2 must wait for the post-null streak, got {a['first_confirmed_step'][0][2]}")
+    check("first confirmed forecast times",
+          a["first_confirmed_forecast_time"] ==
+          [["2026-11-16T01:00:00+00:00", "2026-11-16T03:00:00+00:00",
+            "2026-11-16T03:00:00+00:00", "2026-11-16T01:00:00+00:00", None]],
+          str(a["first_confirmed_forecast_time"]))
+    check("first confirmed group ids",
+          a["first_confirmed_group_id"] == [[t1[0], t3[0], t3[0], t1[0], None]],
+          str(a["first_confirmed_group_id"]))
+    check("first confirmed product ids",
+          a["first_confirmed_product_id"] == [[t1[1], t3[1], t3[1], t1[1], None]],
+          str(a["first_confirmed_product_id"]))
+    check("confirmed cell count", a["confirmed_cell_count"] == 4, str(a["confirmed_cell_count"]))
+    check("probability line echoed", a["probability_threshold"] == 0.5)
+
+    # exactly two times: a cell qualifies only if both rounds qualify
+    s, two = analysis(base_a, [t0[0], t1[0]])
+    check("two-time analysis returns only double-qualified cells",
+          s == 200 and two["first_confirmed_step"] == [[2, None, None, 2, None]],
+          str(two.get("first_confirmed_step")))
+
+    # higher line: p=0.5 no longer qualifies, p=1 does
+    s, strict = analysis(base_a, order, threshold=5.0, line=0.75)
+    check("higher warning line drops boundary cells",
+          strict["first_confirmed_step"] == [[2, 4, 4, None, None]],
+          str(strict["first_confirmed_step"]))
+
+    # different threshold selects a different source column in the same product
+    s, thr10 = analysis(base_a, order, threshold=10.0, line=0.75)
+    check("threshold 10 uses the same products' second threshold",
+          thr10["product_ids"] == a["product_ids"] and thr10["rain_threshold"] == 10.0)
+    s, bad_thr = analysis(base_a, order, threshold=7.5)
+    check("unregistered rain threshold rejected",
+          s == 422 and bad_thr["error"]["code"] == "THRESHOLD_MISMATCH", str(bad_thr))
+
+    print("\n[14] cross-time analysis input validation")
+    s, d = analysis(base_a, [t0[0]])
+    check("single time rejected (need 2-6)", s == 422, str(d))
+    s, d = analysis(base_a, [t0[0], t1[0], t2[0], t3[0], t0[0], t1[0], t2[0]])
+    check("seven times rejected", s == 422, str(d))
+    s, d = analysis(base_a, [t0[0], t1[0], t0[0]])
+    check("duplicate group ids rejected", s == 422, str(d))
+    s, d = analysis(base_a, [t1[0], t0[0]])
+    check("descending time order rejected",
+          s == 422 and d["error"]["code"] == "TIME_SEQUENCE_INVALID", str(d))
+    s, d = analysis(base_a, [t0[0], t2[0]])
+    check("non-hour gap rejected",
+          s == 422 and d["error"]["code"] == "TIME_SEQUENCE_INVALID", str(d))
+    s, d = analysis(base_a, order, line=1.5)
+    check("probability line > 1 rejected", s == 422, str(d))
+    s, d = analysis(base_a, order, line=-0.1)
+    check("negative probability line rejected", s == 422, str(d))
+    s, d = analysis(base_a, order, threshold=-3.0)
+    check("negative rain threshold rejected", s == 422, str(d))
+    s, d = analysis(base_a, ["nosuch", t1[0]])
+    check("unknown time -> 404", s == 404 and d["error"]["code"] == "GROUP_NOT_FOUND", str(d))
+
+    # missing current product (registered + members submitted, never published)
+    g_missing = register(base_b, members=2, rows=1, cols=5, thresholds=[5.0],
+                         forecast_time="2026-11-16T04:00:00Z")
+    for member in ("m1", "m2"):
+        http("PUT", base_b, f"/groups/{g_missing['group_id']}/members/{member}",
+             {"rain": [[10, 10, 10, 10, 10]], "revision": 1})
+    s, d = analysis(base_a, [t3[0], g_missing["group_id"]])
+    check("time without a current product is refused",
+          s == 409 and d["error"]["code"] == "ANALYSIS_SOURCE_MISSING", str(d))
+
+    # grid mismatch among sources (same hour sequence, different grid)
+    gA = register(base_a, members=2, rows=1, cols=2, thresholds=[5.0],
+                  forecast_time="2026-11-16T05:00:00Z")
+    gB = register(base_a, members=2, rows=1, cols=3, thresholds=[5.0],
+                  forecast_time="2026-11-16T06:00:00Z")
+    for gid, width in ((gA["group_id"], 2), (gB["group_id"], 3)):
+        for member in ("m1", "m2"):
+            http("PUT", base_a, f"/groups/{gid}/members/{member}",
+                 {"rain": [[10.0] * width], "revision": 1})
+        http("POST", base_a, f"/groups/{gid}/publish")
+    s, d = analysis(base_a, [gA["group_id"], gB["group_id"]])
+    check("grid shape mismatch refused",
+          s == 422 and d["error"]["code"] == "GRID_MISMATCH", str(d))
+
+    print("\n[15] analysis is invalidated by concurrent source correction")
+    conc_specs = {
+        "a": {"time": "2026-11-16T10:00:00Z",
+              "m1": [8.0] * 40, "m2": [8.0] * 40},
+        "b": {"time": "2026-11-16T11:00:00Z",
+              "m1": [8.0] * 40, "m2": [8.0] * 40},
+        "c": {"time": "2026-11-16T12:00:00Z",
+              "m1": [8.0] * 40, "m2": [8.0] * 40},
+    }
+    conc = _build_series(base_a, conc_specs, rows=5, cols=8, thresholds=(5.0,))
+    conc_ids = [conc[k][0] for k in ("a", "b", "c")]
+
+    result: Dict[str, Any] = {}
+
+    def worker_analysis() -> None:
+        result["status"], result["body"] = analysis(base_a, conc_ids)
+
+    th = threading.Thread(target=worker_analysis)
+    th.start()
+    time.sleep(0.15)  # analysis is now in its (delayed) compute phase
+    t0w = time.time()
+    s, corr = http("PUT", base_b, f"/groups/{conc['b'][0]}/members/m1",
+                   {"rain": [[0.0] * 8 for _ in range(5)], "revision": 2})
+    correction_elapsed = time.time() - t0w
+    check("correction during analysis accepted", s == 200, str(corr))
+    if hooks_enabled:
+        check("analysis held no write lock during compute",
+              correction_elapsed < 0.5, f"{correction_elapsed:.2f}s")
+    th.join()
+    check("analysis refuses to deliver the superseded combination",
+          result["status"] == 409
+          and result["body"]["error"]["code"] == "ANALYSIS_SOURCE_CHANGED", str(result))
+
+    # a different time keeps ingesting while an analysis is computing
+    def worker_analysis2() -> None:
+        result["status2"], result["body2"] = analysis(base_b, conc_ids)
+
+    s, _ = http("POST", base_a, f"/groups/{conc['b'][0]}/publish")  # restore a current product
+    check("republish after correction succeeds", s == 200)
+    th2 = threading.Thread(target=worker_analysis2)
+    th2.start()
+    time.sleep(0.15)
+    t0w = time.time()
+    g_other = register(base_a, members=2, rows=3, cols=3, thresholds=[5.0],
+                       forecast_time="2026-11-16T13:00:00Z")
+    s, _ = http("PUT", base_b, f"/groups/{g_other['group_id']}/members/m1",
+                {"rain": [[8.0] * 3 for _ in range(3)], "revision": 1})
+    s2, _ = http("PUT", base_b, f"/groups/{g_other['group_id']}/members/m2",
+                 {"rain": [[8.0] * 3 for _ in range(3)], "revision": 1})
+    ingest_elapsed = time.time() - t0w
+    check("other time ingests while analysis computes", s == 200 and s2 == 200)
+    if hooks_enabled:
+        check("other-time ingest stayed fast during analysis",
+              ingest_elapsed < 0.5, f"{ingest_elapsed:.2f}s")
+    th2.join()
+    check("retried analysis succeeds after republish", result["status2"] == 200, str(result))
+    s, cur_b = http("GET", base_a, f"/groups/{conc['b'][0]}/products/current")
+    check("retried analysis uses the corrected current product",
+          result["body2"]["products_used"][1]["product_id"] == cur_b["product_id"],
+          f"{result['body2']['products_used'][1]} vs {cur_b['product_id']}")
+    check("all cells confirmed across consistent products",
+          result["body2"]["confirmed_cell_count"] == 40)
+
+    # correction + immediate republish while an analysis is in flight: the
+    # current product id changes, so the in-flight result must be discarded
+    def worker_analysis3() -> None:
+        result["status3"], result["body3"] = analysis(base_a, conc_ids)
+
+    th3 = threading.Thread(target=worker_analysis3)
+    th3.start()
+    time.sleep(0.15)
+    s, _ = http("PUT", base_b, f"/groups/{conc['a'][0]}/members/m2",
+                {"rain": [[9.0] * 8 for _ in range(5)], "revision": 2})
+    check("correction accepted mid-analysis (republish case)", s == 200)
+    s, new_a = http("POST", base_b, f"/groups/{conc['a'][0]}/publish")
+    check("republish mid-analysis succeeds", s == 200)
+    th3.join()
+    check("analysis invalidated by a republish during compute",
+          result["status3"] == 409
+          and result["body3"]["error"]["code"] == "ANALYSIS_SOURCE_CHANGED",
+          str(result.get("status3")))
+    s, final = analysis(base_b, conc_ids)
+    check("analysis after the new current products succeeds",
+          s == 200 and final["product_ids"][0] == new_a["product_id"], str(final))
+
+    if hooks_enabled:
+        print("\n[16] injected compute failure on analysis is reported, nothing persisted")
+        before = http("GET", base_a, f"/groups/{conc['a'][0]}/products/current")[1]["product_id"]
+        with open(fail_marker, "w") as fh:
+            fh.write("fail")
+        s, d = analysis(base_a, conc_ids)
+        os.remove(fail_marker)
+        check("injected failure surfaces as 500",
+              s == 500 and d["error"]["code"] == "COMPUTE_FAILED", str(d))
+        after = http("GET", base_a, f"/groups/{conc['a'][0]}/products/current")[1]["product_id"]
+        check("analysis failure leaves sources untouched", before == after)
+    else:
+        print("\n[16] SKIP  analysis failure injection (RAIN_TEST_FAIL_MARKER not configured)")
 
 
 if __name__ == "__main__":

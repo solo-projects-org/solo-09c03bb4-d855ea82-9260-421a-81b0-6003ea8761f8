@@ -11,6 +11,11 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
+try:  # POSIX only; the Docker image and run_local.sh target Linux
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback (no cross-process init lock)
+    fcntl = None  # type: ignore[assignment]
+
 DB_PATH = os.environ.get("RAIN_DB_PATH", "/data/rainfall.db")
 BUSY_TIMEOUT_MS = int(os.environ.get("RAIN_BUSY_TIMEOUT_MS", "10000"))
 
@@ -79,15 +84,38 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _init_lock() -> Iterator[None]:
+    """Cross-process lock so two instances booting together initialize once."""
+    if fcntl is None:  # pragma: no cover
+        yield
+        return
+    lock_path = os.path.abspath(DB_PATH) + ".init.lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def init_db() -> None:
-    """Create schema and switch the file into WAL mode (idempotent)."""
-    conn = connect()
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.executescript(_SCHEMA)
-    finally:
-        conn.close()
+    """Create schema and switch the file into WAL mode (idempotent).
+
+    Switching the journal mode needs a brief exclusive lock and does not
+    always honour the busy handler, so two instances booting at the same
+    moment could otherwise fail startup. Serialize this short phase with an
+    OS file lock (released as soon as initialization finishes).
+    """
+    with _init_lock():
+        conn = connect()
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.executescript(_SCHEMA)
+        finally:
+            conn.close()
 
 
 @contextmanager

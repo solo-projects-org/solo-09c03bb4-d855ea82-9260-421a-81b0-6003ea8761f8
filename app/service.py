@@ -18,12 +18,20 @@ import json
 import os
 import time
 import uuid
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
+
+import numpy as np
 
 from .db import get_conn
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import (
+    ANALYSIS_MAX_STEPS,
+    ANALYSIS_MIN_STEPS,
+    CrossTimeAnalysisRequest,
+    RegisterRequest,
+    SubmitRequest,
+)
 from .storage import (
     compute_probabilities,
     content_hash,
@@ -37,6 +45,7 @@ from .storage import (
 
 # --- test hooks (disabled unless explicitly enabled; never on by default) ---
 PUBLISH_DELAY_S = float(os.environ.get("RAIN_TEST_PUBLISH_DELAY_S", "0"))
+ANALYSIS_DELAY_S = float(os.environ.get("RAIN_TEST_ANALYSIS_DELAY_S", "0"))
 FAIL_MARKER = os.environ.get("RAIN_TEST_FAIL_MARKER", "")
 
 
@@ -352,6 +361,295 @@ def publish_product(group_id: str) -> Dict[str, Any]:
             continue
 
     raise ApiError(409, "REVISION_CHANGED", "member revisions kept changing during publish; retry the request")
+
+
+# --------------------------------------------------------------------------- #
+# Cross-time persistent high-risk analysis
+# --------------------------------------------------------------------------- #
+CONSECUTIVE_ROUNDS = 2
+THRESHOLD_TOL = 1e-9
+
+
+def _parse_forecast_time(raw: str) -> datetime:
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:  # defensive: registration always stores an offset
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _latest_revision_map(conn, group_id: str, member_idxs: List[int]) -> Dict[int, int]:
+    latest: Dict[int, int] = {}
+    for idx in member_idxs:
+        row = conn.execute(
+            "SELECT revision FROM member_revisions"
+            " WHERE group_id = ? AND member_idx = ? ORDER BY revision DESC LIMIT 1",
+            (group_id, idx),
+        ).fetchone()
+        if row is None:
+            raise ApiError(
+                409,
+                "ANALYSIS_SOURCE_MISSING",
+                f"group {group_id!r} has a member with no submitted revision",
+            )
+        latest[int(idx)] = int(row["revision"])
+    return latest
+
+
+def _match_threshold(values: List[float], wanted: float) -> float | None:
+    """Return the registered threshold equal to ``wanted`` (within float tolerance)."""
+    for value in values:
+        if abs(float(value) - float(wanted)) <= THRESHOLD_TOL:
+            return float(value)
+    return None
+
+
+def _read_analysis_inputs(
+    conn, group_ids: List[str], threshold: float
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Read one consistent snapshot of every time's current product.
+
+    Runs inside a read transaction: in WAL mode it never blocks writers, so
+    other forecast times keep ingesting while the analysis snapshot is taken.
+    """
+    steps: List[Dict[str, Any]] = []
+    grid: Tuple[int, int] | None = None
+    prev_time: datetime | None = None
+    for position, group_id in enumerate(group_ids, start=1):
+        group = _get_group(conn, group_id)
+        forecast_time = _parse_forecast_time(group["forecast_time"])
+
+        if prev_time is not None:
+            delta = forecast_time - prev_time
+            if delta <= timedelta(0):
+                raise ApiError(
+                    422,
+                    "TIME_SEQUENCE_INVALID",
+                    "group_ids must be ordered by strictly ascending UTC forecast time",
+                )
+            if delta != timedelta(hours=1):
+                raise ApiError(
+                    422,
+                    "TIME_SEQUENCE_INVALID",
+                    (
+                        f"adjacent forecast times must be exactly 1 hour apart; "
+                        f"got {delta.total_seconds() / 3600:g}h between "
+                        f"{prev_time.isoformat()} and {forecast_time.isoformat()}"
+                    ),
+                )
+        prev_time = forecast_time
+
+        if grid is None:
+            grid = (int(group["rows"]), int(group["cols"]))
+        elif grid != (int(group["rows"]), int(group["cols"])):
+            raise ApiError(
+                422,
+                "GRID_MISMATCH",
+                (
+                    f"group {group_id!r} has grid {group['rows']}x{group['cols']}, "
+                    f"expected {grid[0]}x{grid[1]} (all times must share one grid shape)"
+                ),
+            )
+
+        product = conn.execute(
+            "SELECT product_id, revision_map FROM products"
+            " WHERE group_id = ? AND is_current = 1",
+            (group_id,),
+        ).fetchone()
+        if product is None:
+            raise ApiError(
+                409,
+                "ANALYSIS_SOURCE_MISSING",
+                (
+                    f"group {group_id!r} (forecast time {forecast_time.isoformat()}) "
+                    "has no current product; publish every time step first"
+                ),
+            )
+
+        canonical_threshold = _match_threshold(group["thresholds"], threshold)
+        if canonical_threshold is None:
+            raise ApiError(
+                422,
+                "THRESHOLD_MISMATCH",
+                (
+                    f"rain threshold {threshold:g} is not registered for group {group_id!r} "
+                    f"(available: {group['thresholds']})"
+                ),
+            )
+        trow = conn.execute(
+            "SELECT probability_blob FROM product_thresholds"
+            " WHERE product_id = ? AND threshold = ?",
+            (int(product["product_id"]), canonical_threshold),
+        ).fetchone()
+        if trow is None:
+            raise ApiError(
+                422,
+                "THRESHOLD_MISMATCH",
+                (
+                    f"product {int(product['product_id'])} of group {group_id!r} "
+                    f"has no threshold {canonical_threshold:g}"
+                ),
+            )
+
+        steps.append(
+            {
+                "position": position,
+                "group_id": group_id,
+                "forecast_time": forecast_time,
+                "product_id": int(product["product_id"]),
+                "revision_map": {int(k): int(v) for k, v in json.loads(product["revision_map"]).items()},
+                "probability": decode_float(trow["probability_blob"], grid[0] * grid[1]),
+                "member_idxs": sorted(
+                    int(m["member_idx"])
+                    for m in conn.execute(
+                        "SELECT member_idx FROM members WHERE group_id = ?", (group_id,)
+                    )
+                ),
+            }
+        )
+    assert grid is not None
+    return steps, grid[0], grid[1]
+
+
+def _verify_analysis_sources(conn, steps: List[Dict[str, Any]]) -> None:
+    """Fail if any current product changed while the analysis was computing.
+
+    Checks both the current-product identity (a correction expires it, a
+    republish creates a new one) and the latest member revisions against the
+    revision set the product was computed from.
+    """
+    for step in steps:
+        gid = step["group_id"]
+        current = conn.execute(
+            "SELECT product_id FROM products WHERE group_id = ? AND is_current = 1",
+            (gid,),
+        ).fetchone()
+        if current is None or int(current["product_id"]) != step["product_id"]:
+            raise ApiError(
+                409,
+                "ANALYSIS_SOURCE_CHANGED",
+                (
+                    f"current product of group {gid!r} changed while analyzing "
+                    "(member correction or republish); retry the analysis"
+                ),
+            )
+        latest = _latest_revision_map(conn, gid, step["member_idxs"])
+        if latest != step["revision_map"]:
+            raise ApiError(
+                409,
+                "ANALYSIS_SOURCE_CHANGED",
+                (
+                    f"member revisions of group {gid!r} changed while analyzing; "
+                    "retry the analysis"
+                ),
+            )
+
+
+def analyze_across_times(payload: CrossTimeAnalysisRequest) -> Dict[str, Any]:
+    group_ids = list(payload.group_ids)
+    threshold = float(payload.threshold)
+    line = float(payload.probability_threshold)
+    if not ANALYSIS_MIN_STEPS <= len(group_ids) <= ANALYSIS_MAX_STEPS:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"group_ids must contain {ANALYSIS_MIN_STEPS}-{ANALYSIS_MAX_STEPS} forecast times",
+        )
+
+    # 1) consistent read snapshot (read transaction only: ingestion is not blocked)
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN")
+            steps, rows, cols = _read_analysis_inputs(conn, group_ids, threshold)
+            conn.execute("COMMIT")
+        except ApiError:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if _is_busy(exc):
+                raise ApiError(503, "DATABASE_BUSY", "database locked by another writer; retry") from exc
+            raise
+
+    # 2) slow NumPy work outside any transaction: no write lock is ever taken
+    if ANALYSIS_DELAY_S > 0:
+        time.sleep(ANALYSIS_DELAY_S)
+    if FAIL_MARKER and os.path.exists(FAIL_MARKER):
+        raise ApiError(500, "COMPUTE_FAILED", "injected computation failure (test hook)")
+    try:
+        probs = np.vstack([s["probability"].reshape(1, -1) for s in steps])  # (T, N)
+        # NaN marks an all-missing cell -> null probability; it breaks a streak.
+        qualifies = np.where(np.isnan(probs), False, probs >= line)  # (T, N)
+        # A cell is confirmed at time t (t >= 1) exactly when rounds t-1 and t
+        # both qualify. The earliest such t is the first confirmation.
+        pairs = qualifies[1:] & qualifies[:-1]  # (T-1, N)
+        has = pairs.any(axis=0)  # (N,)
+        first = np.where(has, pairs.argmax(axis=0) + 1, -1).astype(np.int64)  # (N,)
+        index_grid = [
+            [None if int(v) < 0 else int(v) + 1 for v in row]
+            for row in first.reshape(rows, cols)
+        ]
+        time_grid = [
+            [None if int(v) < 0 else steps[int(v)]["forecast_time"].isoformat() for v in row]
+            for row in first.reshape(rows, cols)
+        ]
+        group_grid = [
+            [None if int(v) < 0 else steps[int(v)]["group_id"] for v in row]
+            for row in first.reshape(rows, cols)
+        ]
+        product_grid = [
+            [None if int(v) < 0 else steps[int(v)]["product_id"] for v in row]
+            for row in first.reshape(rows, cols)
+        ]
+        confirmed = int(has.sum())
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(500, "COMPUTE_FAILED", f"cross-time analysis failed: {exc}") from exc
+
+    # 3) re-validate under a fresh read transaction; never serve a stale mix
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN")
+            _verify_analysis_sources(conn, steps)
+            conn.execute("COMMIT")
+        except ApiError:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if _is_busy(exc):
+                raise ApiError(503, "DATABASE_BUSY", "database locked by another writer; retry") from exc
+            raise
+
+    return {
+        "group_ids": group_ids,
+        "forecast_times": [s["forecast_time"].isoformat() for s in steps],
+        "rows": rows,
+        "cols": cols,
+        "rain_threshold": threshold,
+        "probability_threshold": line,
+        "consecutive_rounds_required": CONSECUTIVE_ROUNDS,
+        "product_ids": [s["product_id"] for s in steps],
+        "products_used": [
+            {
+                "step": s["position"],
+                "group_id": s["group_id"],
+                "forecast_time": s["forecast_time"].isoformat(),
+                "product_id": s["product_id"],
+                "revision_map": s["revision_map"],
+            }
+            for s in steps
+        ],
+        "first_confirmed_step": index_grid,
+        "first_confirmed_forecast_time": time_grid,
+        "first_confirmed_group_id": group_grid,
+        "first_confirmed_product_id": product_grid,
+        "confirmed_cell_count": confirmed,
+    }
 
 
 # --------------------------------------------------------------------------- #

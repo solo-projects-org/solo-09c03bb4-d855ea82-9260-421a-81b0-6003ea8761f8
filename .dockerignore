@@ -6,5 +6,7 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.db.init.lock
 .git/
 .pytest_cache/
+tests/

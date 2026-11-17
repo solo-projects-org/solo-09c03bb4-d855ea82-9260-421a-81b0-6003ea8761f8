@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MAX_DIM = 4096
 MAX_CELLS = 16_777_216  # hard cap on rows*cols to avoid unbounded payloads
 NAME_RE = r"^[A-Za-z0-9_.\-]{1,64}$"
+ANALYSIS_MIN_STEPS = 2
+ANALYSIS_MAX_STEPS = 6
 
 
 def _check_grid(rain: List[List[float]], missing: List[List[int]] | None) -> None:
@@ -110,3 +112,54 @@ class SubmitRequest(BaseModel):
         # errors share the same JSON error envelope.
         _check_grid(self.rain, self.missing)
         return self
+
+
+class CrossTimeAnalysisRequest(BaseModel):
+    """Input for the cross-forecast-time persistent high-risk analysis."""
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "group_ids": ["a1b2c3", "d4e5f6", "a7b8c9"],
+                    "threshold": 5.0,
+                    "probability_threshold": 0.5,
+                }
+            ]
+        }
+    }
+
+    group_ids: List[str] = Field(
+        ...,
+        min_length=ANALYSIS_MIN_STEPS,
+        max_length=ANALYSIS_MAX_STEPS,
+        description=(
+            f"{ANALYSIS_MIN_STEPS}-{ANALYSIS_MAX_STEPS} forecast-time IDs ordered by "
+            "ascending UTC forecast time, with exactly one hour between adjacent times"
+        ),
+    )
+    threshold: float = Field(
+        ...,
+        description="rainfall threshold (mm) that must exist in every source product",
+    )
+    probability_threshold: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="probability warning line in [0, 1]; a cell qualifies when probability >= this",
+    )
+
+    @field_validator("group_ids")
+    @classmethod
+    def _unique_groups(cls, v: List[str]) -> List[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("group_ids must be unique")
+        return v
+
+    @field_validator("threshold")
+    @classmethod
+    def _rain_threshold(cls, v: float) -> float:
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv) or fv < 0:
+            raise ValueError("threshold must be finite and non-negative")
+        return fv

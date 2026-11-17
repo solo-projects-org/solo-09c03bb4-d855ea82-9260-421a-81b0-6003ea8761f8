@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .db import init_db
 from .errors import ApiError
-from .schemas import RegisterRequest, SubmitRequest
+from .schemas import CrossTimeAnalysisRequest, RegisterRequest, SubmitRequest
 from . import service
 
 app = FastAPI(
@@ -116,3 +116,34 @@ def list_products(group_id: str) -> dict:
 )
 def get_product(group_id: str, product_id: int) -> dict:
     return service.get_product(group_id, product_id)
+
+
+@app.post(
+    "/analysis/persistent-high-risk",
+    tags=["analysis"],
+    summary="跨时次识别持续高风险网格（连续两轮达标）",
+    description=(
+        "按 UTC 时间升序传入 2～6 个相邻间隔 1 小时的时次 ID，读取各时次现行产品，"
+        "在同一网格上找出连续两轮概率均非空且 ≥ 概率警戒线的格，"
+        "返回该格首次确认的时次（1 起）及所用产品 ID。"
+        "概率为空会中断连续判定；产品缺失、网格或阈值不匹配则拒绝分析；"
+        "计算期间来源产品被更正/撤回/重发时返回 409 ANALYSIS_SOURCE_CHANGED，提示重试。"
+    ),
+    responses={
+        200: {"description": "分析完成；first_confirmed_* 矩阵中未命中的格为 null"},
+        409: {
+            "description": (
+                "来源产品不可用或在计算期间变化：产品缺失/被撤回 -> ANALYSIS_SOURCE_MISSING；"
+                "成员更正或重新发布 -> ANALYSIS_SOURCE_CHANGED（重试即可）"
+            )
+        },
+        422: {
+            "description": (
+                "请求或数据不匹配：时间顺序/间隔 -> TIME_SEQUENCE_INVALID；"
+                "网格 -> GRID_MISMATCH；雨量阈值 -> THRESHOLD_MISMATCH；字段 -> VALIDATION_ERROR"
+            )
+        },
+    },
+)
+def analyze(payload: CrossTimeAnalysisRequest) -> dict:
+    return service.analyze_across_times(payload)

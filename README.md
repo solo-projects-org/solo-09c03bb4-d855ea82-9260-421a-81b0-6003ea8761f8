@@ -23,6 +23,53 @@
 | 慢计算不阻塞其他时次入仓 | NumPy 计算在写事务**之外**完成，计算期间不持写锁；仅在最后落库阶段短时加锁 |
 | 可启动的双实例 Docker Compose 和 Swagger | `docker compose up` 起 `api-a`(:8081)/`api-b`(:8082)，共享命名卷；Swagger 在 `/docs` |
 
+### 跨时次持续高风险分析（`POST /analysis/persistent-high-risk`）
+
+值班员需要从连续几个时次的预报里找出**持续高风险网格**，安排现场复核。
+
+| 需求 | 实现 |
+| --- | --- |
+| 传入 2～6 个时次 ID，按 UTC 升序、相邻间隔 1 小时 | 请求体 `group_ids`；服务端按 `forecast_time` 校验严格递增且相邻差恰为 1 小时，否则 `422 TIME_SEQUENCE_INVALID`；重复 ID 在请求模型层拒绝 |
+| 传入雨量阈值与概率警戒线 | `threshold`（须存在于每个时次的阈值列表，容差 1e-9）、`probability_threshold`（`[0,1]`） |
+| 读取各时次**现行产品** | 只读 `products.is_current=1`；任一时次无现行产品 → `409 ANALYSIS_SOURCE_MISSING` |
+| 同形网格才分析 | 各时次 `rows/cols` 必须一致，否则 `422 GRID_MISMATCH` |
+| 唯一命中阈值才对时序 | 阈值不在某时次产品中 → `422 THRESHOLD_MISMATCH` |
+| 连续两轮概率非空且均 ≥ 警戒线 | 逐格判定 `p[t] >= line`（边界相等算达标，`null` 视为不达标）；`null` 会**中断**连续计数；命中后返回该格首次确认的时次 |
+| 返回首次确认时次 | 响应含 `first_confirmed_step`（1 起的时次序号）以及同一位置的 `first_confirmed_forecast_time` / `_group_id` / `_product_id`；未命中的格为 `null` |
+| 列出所用产品 ID | `product_ids`（按时次顺序）与 `products_used`（含产品 ID、预报时间、成员修订集） |
+| 计算期间来源被更正/撤回/重发则不交付旧组合 | 计算前后各取一次只读快照，提交前复核每个时次的**现行产品 ID** 与**各成员最新修订**；不一致 → `409 ANALYSIS_SOURCE_CHANGED`，提示重试，绝不返回混合旧数据 |
+| 计算不长期占用写锁 | 分析全程只用只读事务（WAL 下不阻塞写），NumPy 计算在事务之外；不需要写锁，其他时次可继续入仓 |
+
+响应示例（`1x5` 网格、4 个时次，第 2 个时次确认前两格）：
+
+```json
+{
+  "group_ids": ["g0", "g1", "g2", "g3"],
+  "forecast_times": ["2026-11-16T00:00:00+00:00", "2026-11-16T01:00:00+00:00",
+                     "2026-11-16T02:00:00+00:00", "2026-11-16T03:00:00+00:00"],
+  "rows": 1, "cols": 5,
+  "rain_threshold": 5.0, "probability_threshold": 0.5,
+  "consecutive_rounds_required": 2,
+  "product_ids": [11, 12, 13, 14],
+  "products_used": [
+    {"step": 1, "group_id": "g0", "forecast_time": "2026-11-16T00:00:00+00:00",
+     "product_id": 11, "revision_map": {"0": 1, "1": 1}},
+    {"step": 2, "group_id": "g1", "forecast_time": "2026-11-16T01:00:00+00:00",
+     "product_id": 12, "revision_map": {"0": 1, "1": 1}}
+  ],
+  "first_confirmed_step": [[2, 4, 4, 2, null]],
+  "first_confirmed_forecast_time": [[
+    "2026-11-16T01:00:00+00:00", "2026-11-16T03:00:00+00:00",
+    "2026-11-16T03:00:00+00:00", "2026-11-16T01:00:00+00:00", null]],
+  "first_confirmed_group_id": [[ "g1", "g3", "g3", "g1", null ]],
+  "first_confirmed_product_id": [[ 12, 14, 14, 12, null ]],
+  "confirmed_cell_count": 4
+}
+```
+
+新增错误码：`TIME_SEQUENCE_INVALID(422)`、`THRESHOLD_MISMATCH(422)`、
+`ANALYSIS_SOURCE_MISSING(409)`、`ANALYSIS_SOURCE_CHANGED(409)`。
+
 ### 交错发布的一致性（核心并发设计）
 
 1. 先在一个只读事务里取快照：每个成员的**最新修订号**及对应网格；
@@ -48,6 +95,7 @@ SQLite 启用 WAL + `busy_timeout=10s`；所有写事务为 `BEGIN IMMEDIATE`，
 | GET | `/groups/{gid}/products/current` | 当前可用于预警的产品（无则 404） |
 | GET | `/groups/{gid}/products` | 全部产品（含过期历史） |
 | GET | `/groups/{gid}/products/{pid}` | 按 ID 查历史产品 |
+| POST | `/analysis/persistent-high-risk` | 跨时次识别持续高风险网格（连续两轮达标） |
 
 ### 示例
 
@@ -71,6 +119,14 @@ curl -s -X PUT localhost:8081/groups/$GID/members/m3 -H 'Content-Type: applicati
 # 3) 发布并查询
 curl -s -X POST localhost:8081/groups/$GID/publish
 curl -s localhost:8082/groups/$GID/products/current
+
+# 4) 跨时次持续高风险分析（$G00 … $G03 为 4 个连续整点、同网格时次）
+curl -s -X POST localhost:8081/analysis/persistent-high-risk \
+  -H 'Content-Type: application/json' -d '{
+    "group_ids": ["'$G00'", "'$G01'", "'$G02'", "'$G03'"],
+    "threshold": 5.0,
+    "probability_threshold": 0.5
+  }'
 ```
 
 产品响应片段（全缺测格 `null` + 分母 0）：
@@ -98,7 +154,9 @@ curl -s localhost:8082/groups/$GID/products/current
 `VALIDATION_ERROR(422)`、`GRID_MISMATCH(422)`、`NEGATIVE_RAIN(422)`、
 `REVISION_CONFLICT(409)`、`REVISION_CONTENT_CONFLICT(409)`、`MEMBERS_INCOMPLETE(409)`、
 `NO_CURRENT_PRODUCT(404)`、`GROUP_NOT_FOUND/MEMBER_NOT_FOUND/PRODUCT_NOT_FOUND(404)`、
-`COMPUTE_FAILED(500)`、`DATABASE_BUSY(503)`。
+`COMPUTE_FAILED(500)`、`DATABASE_BUSY(503)`，以及跨时次分析的
+`TIME_SEQUENCE_INVALID(422)`、`THRESHOLD_MISMATCH(422)`、
+`ANALYSIS_SOURCE_MISSING(409)`、`ANALYSIS_SOURCE_CHANGED(409)`。
 
 ## 3. 运行
 
@@ -122,10 +180,11 @@ pip install -r requirements.txt
 环境变量：`RAIN_DB_PATH`（默认 `/data/rainfall.db`）、`RAIN_BUSY_TIMEOUT_MS`（默认 10000）。
 另有两个**默认关闭**的测试钩子：`RAIN_TEST_PUBLISH_DELAY_S`（发布计算延时）、
 `RAIN_TEST_FAIL_MARKER`（该文件存在时发布计算确定性失败），仅用于自测，生产不要设置。
+跨时次分析另有 `RAIN_TEST_ANALYSIS_DELAY_S`（分析计算延时，默认关闭），用于自测交错一致性。
 
 ## 4. 自测
 
-`tests/selftest.py` 只用标准库，默认自动拉起两个共享同一 SQLite 的 uvicorn 实例并跑 64 项断言：
+`tests/selftest.py` 只用标准库，默认自动拉起两个共享同一 SQLite 的 uvicorn 实例并跑 105 项断言：
 
 ```bash
 python tests/selftest.py
@@ -135,7 +194,10 @@ RAIN_BASE_A=http://127.0.0.1:8081 RAIN_BASE_B=http://127.0.0.1:8082 python tests
 
 覆盖：参数校验、幂等/异文拒收、修订号顺序、成员齐全门禁、概率与分母数学、全缺测空值、
 更正即过期与历史可查、双实例交错发布一致性、并行发布幂等、故障注入下无半份产品、
-慢计算不阻塞其他时次入仓、Swagger/OpenAPI 可用性。
+慢计算不阻塞其他时次入仓、Swagger/OpenAPI 可用性；跨时次分析还覆盖连续两轮语义、
+概率空值中断连续、阈值/警戒线边界、2 与 6 上限、时间顺序与 1 小时间隔校验、
+来源产品缺失/网格不匹配/阈值不匹配拒绝、分析期间成员更正或更正后重新发布则整体作废并提示重试、
+分析计算不持写锁且不阻塞其他时次入仓。
 
 ## 5. 目录结构
 
@@ -143,7 +205,7 @@ RAIN_BASE_A=http://127.0.0.1:8081 RAIN_BASE_B=http://127.0.0.1:8082 python tests
 app/
   main.py       FastAPI 路由、统一错误处理、启动建表
   schemas.py    Pydantic 请求模型与结构校验
-  service.py    登记/提交/发布/查询事务逻辑与并发控制
+  service.py    登记/提交/发布/查询事务逻辑、跨时次持续高风险分析与并发控制
   storage.py    网格序列化、内容哈希、NumPy 概率计算
   db.py         SQLite 连接、WAL、schema
   errors.py     统一 API 异常
